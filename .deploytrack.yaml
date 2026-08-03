@@ -1,0 +1,11 @@
+tracker_url: http://localhost:8082
+project_id: 1
+image_repository: ghcr.io/blackbard22/test-repo-1
+ghcr_username: Blackbard22
+workflow_ref: dev
+branches:
+    - pre-dev
+    - dev
+    - staging
+    - production
+template_version: 0.1.5

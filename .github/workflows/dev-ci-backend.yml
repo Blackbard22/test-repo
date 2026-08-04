@@ -1,7 +1,7 @@
 name: Dev — Backend lint, build, GHCR, tracker
 
-# allocate DeployTrack backend build → lint → docker build/push GHCR → report dev deploy
-# Lint failure (after allocate) reports status: failed for env=dev.
+# Single job (Windows-safe): allocate → lint → build/push → report.
+# Avoids cross-job GITHUB_OUTPUT propagation bugs on Windows PowerShell.
 on:
   push:
     branches: [dev]
@@ -15,15 +15,14 @@ on:
         default: false
 
 jobs:
-  lint:
+  ci:
     runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
     defaults:
       run:
         shell: powershell
-    outputs:
-      build_id: ${{ steps.allocate.outputs.build_id }}
-      version: ${{ steps.allocate.outputs.version }}
-      build_number: ${{ steps.allocate.outputs.build_number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +36,11 @@ jobs:
           IMAGE_REPO: ${{ secrets.IMAGE_REPOSITORY }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          function Add-RunnerEnv([string]$Line) {
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, $Line + [Environment]::NewLine, $utf8)
+          }
+
           $body = @{
             project_id       = [int]$env:PROJECT_ID
             commit_sha       = '${{ github.sha }}'
@@ -53,21 +57,27 @@ jobs:
           $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/builds" -Headers $headers -Body $body
           $resp | ConvertTo-Json -Depth 6
 
+          $buildId = [string]$resp.build.id
+          $version = [string]$resp.version
+          $buildNumber = [string]$resp.build_number
           $dockerImage = [string]$resp.'docker_image'
           if (-not $dockerImage -and $resp.build) {
             $dockerImage = [string]$resp.build.'docker_image'
           }
-          if (-not $dockerImage) { throw 'DeployTrack allocate response missing docker_image' }
+          if ([string]::IsNullOrWhiteSpace($buildId)) { throw 'allocate response missing build.id' }
+          if ([string]::IsNullOrWhiteSpace($dockerImage)) { throw 'allocate response missing docker_image' }
 
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "build_id=$($resp.build.id)`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($resp.version)`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "build_number=$($resp.build_number)`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image<<EOF`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "$dockerImage`n")
-          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "EOF`n")
+          Add-RunnerEnv "BUILD_ID=$buildId"
+          Add-RunnerEnv "VERSION=$version"
+          Add-RunnerEnv "BUILD_NUMBER=$buildNumber"
+          Add-RunnerEnv "DOCKER_IMAGE=$dockerImage"
+          $env:BUILD_ID = $buildId
+          $env:VERSION = $version
+          $env:BUILD_NUMBER = $buildNumber
+          $env:DOCKER_IMAGE = $dockerImage
 
-          Write-Host "Allocated backend build for lint job outputs:"
-          Write-Host "  build_id=$($resp.build.id)"
+          Write-Host "Allocated backend build:"
+          Write-Host "  build_id=$buildId"
           Write-Host "  docker_image=$dockerImage"
 
       - name: Optional intentional lint failure
@@ -114,9 +124,9 @@ jobs:
         env:
           TRACKER_URL: ${{ secrets.TRACKER_URL }}
           TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
-          BUILD_ID: ${{ steps.allocate.outputs.build_id }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not $env:BUILD_ID) { throw 'BUILD_ID missing after allocate' }
           $headers = @{ 'Content-Type' = 'application/json' }
           if ($env:TRACKER_TOKEN) {
             $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
@@ -133,25 +143,13 @@ jobs:
             Write-Warning "Failed to report failed lint deploy: $_"
           }
 
-  build-push:
-    needs: lint
-    runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Login to GHCR
         env:
           GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
           $user = [string]$env:GHCR_USERNAME
           $token = [string]$env:GHCR_TOKEN
           if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
@@ -161,7 +159,7 @@ jobs:
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
           New-Item -ItemType Directory -Force -Path $cfg | Out-Null
           Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
-          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg" + [Environment]::NewLine, $utf8)
           $env:DOCKER_CONFIG = $cfg
           $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
           [System.IO.File]::WriteAllText($patFile, $token)
@@ -175,32 +173,19 @@ jobs:
       - name: Build and push backend image
         id: push
         env:
-          BUILD_ID: ${{ needs.lint.outputs.build_id }}
           TRACKER_URL: ${{ secrets.TRACKER_URL }}
           TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:BUILD_ID) { throw 'BUILD_ID is empty - lint job outputs did not propagate' }
-
-          $headers = @{ 'Content-Type' = 'application/json' }
-          if ($env:TRACKER_TOKEN) {
-            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
-          }
-
-          Write-Host "Resolving backend image tag from DeployTrack for build_id=$($env:BUILD_ID)"
-          $build = Invoke-RestMethod -Method GET -Uri "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)" -Headers $headers
-          $dockerImage = [string]$build.'docker_image'
-          if (-not $dockerImage) { throw "build $($env:BUILD_ID) has no docker_image in DeployTrack" }
-
-          Write-Host "  docker_image=$dockerImage"
+          if (-not $env:BUILD_ID) { throw 'BUILD_ID is empty after allocate' }
+          if (-not $env:DOCKER_IMAGE) { throw 'DOCKER_IMAGE is empty after allocate' }
           if (-not (Test-Path './backend')) { throw './backend directory not found - check checkout working directory' }
 
-          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_IMAGE=$dockerImage`n")
-
+          Write-Host "Building backend image $($env:DOCKER_IMAGE) for build_id=$($env:BUILD_ID)"
           try {
-            docker build -t "$dockerImage" ./backend
+            docker build -t "$env:DOCKER_IMAGE" ./backend
             if ($LASTEXITCODE -ne 0) { throw 'backend docker build failed' }
-            docker push "$dockerImage"
+            docker push "$env:DOCKER_IMAGE"
             if ($LASTEXITCODE -ne 0) { throw 'backend docker push failed' }
           } catch {
             $headers = @{ 'Content-Type' = 'application/json' }
@@ -223,9 +208,9 @@ jobs:
         env:
           TRACKER_URL: ${{ secrets.TRACKER_URL }}
           TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
-          BUILD_ID: ${{ needs.lint.outputs.build_id }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
           $body = @{
             build_id    = [int]$env:BUILD_ID
             environment = 'dev'
@@ -240,13 +225,10 @@ jobs:
 
           $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body
           $resp | ConvertTo-Json -Depth 6
-          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DEPLOYMENT_ID=$($resp.id)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DEPLOYMENT_ID=$($resp.id)" + [Environment]::NewLine, $utf8)
+          $env:DEPLOYMENT_ID = [string]$resp.id
 
       - name: Summary
-        env:
-          VERSION: ${{ needs.lint.outputs.version }}
-          BUILD_NUMBER: ${{ needs.lint.outputs.build_number }}
-          BUILD_ID: ${{ needs.lint.outputs.build_id }}
         run: |
           @"
           ### DeployTrack (dev CI — backend)

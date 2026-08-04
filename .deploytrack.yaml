@@ -8,4 +8,4 @@ branches:
     - dev
     - staging
     - production
-template_version: 0.1.5
+template_version: 0.2.0

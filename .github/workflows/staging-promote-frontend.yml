@@ -1,0 +1,194 @@
+name: Staging — Frontend GHCR retag + tracker
+
+# Pull immutable frontend build tag from GHCR, retag :staging (no rebuild), report deploy.
+# Optionally sync GitHub staging branch to origin/dev.
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'DeployTrack build_id to promote'
+        required: true
+        type: string
+
+jobs:
+  promote:
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      packages: write
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Resolve build image
+        id: resolve
+        env:
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BUILD_ID) { throw 'build_id input is required' }
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $build = Invoke-RestMethod -Method GET -Uri "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)" -Headers $headers
+          $component = [string]$build.component
+          if ($component -ne 'frontend') { throw "build $($env:BUILD_ID) component is '$component', expected 'frontend'" }
+          $dockerImage = [string]$build.docker_image
+          if (-not $dockerImage) { throw 'build has no docker_image' }
+          $parts = $dockerImage -split ':', 2
+          $envTag = "$($parts[0]):staging"
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "docker_image=$dockerImage"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "env_tag=$envTag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$($build.version)"
+
+      - name: Login to GHCR
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $user = [string]$env:GHCR_USERNAME
+          $token = [string]$env:GHCR_TOKEN
+          if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GHCR_TOKEN secret is empty' }
+          $user = $user.Trim()
+          $token = $token.Trim()
+          $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
+          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_CONFIG=$cfg"
+          $env:DOCKER_CONFIG = $cfg
+          $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
+          [System.IO.File]::WriteAllText($patFile, $token)
+          try {
+            cmd /c "docker login ghcr.io -u `"$user`" --password-stdin < `"$patFile`""
+            if ($LASTEXITCODE -ne 0) { throw 'docker login ghcr.io failed' }
+          } finally {
+            Remove-Item -Force $patFile -ErrorAction SilentlyContinue
+          }
+
+      - name: Retag frontend image for staging
+        id: retag
+        env:
+          DOCKER_IMAGE: ${{ steps.resolve.outputs.docker_image }}
+          ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
+          BUILD_ID: ${{ inputs.build_id }}
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Report-Failed {
+            $headers = @{ 'Content-Type' = 'application/json' }
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $body = @{
+              build_id    = [int]$env:BUILD_ID
+              environment = 'staging'
+              status      = 'failed'
+              deployed_by = 'github-actions'
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body | Out-Null
+            } catch {
+              Write-Warning "Failed to report failed staging deploy: $_"
+            }
+          }
+          try {
+            docker pull $env:DOCKER_IMAGE
+            if ($LASTEXITCODE -ne 0) { throw 'pull frontend failed' }
+            docker tag $env:DOCKER_IMAGE $env:ENV_TAG
+            docker push $env:ENV_TAG
+            if ($LASTEXITCODE -ne 0) { throw 'push frontend :staging failed' }
+          } catch {
+            Report-Failed
+            throw
+          }
+
+      - name: Record staging deployment (gated promote)
+        id: promote
+        env:
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $body = @{
+            target_environment = 'staging'
+            deployed_by        = 'github-actions'
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $uri = "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)/promote"
+          $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "deployment_id=$($resp.id)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "status=$($resp.status)"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync staging branch to match dev
+        id: git_sync
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin dev
+          $remoteStaging = git ls-remote --heads origin staging
+
+          if ($remoteStaging) {
+            git fetch origin staging
+            git checkout -B staging origin/staging
+            git merge --ff-only origin/dev
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Fast-forward not possible; aligning staging tip to origin/dev"
+              git reset --hard origin/dev
+              if ($LASTEXITCODE -ne 0) { throw 'git reset --hard origin/dev failed' }
+              git push --force-with-lease origin HEAD:staging
+              if ($LASTEXITCODE -ne 0) { throw 'git push --force-with-lease to staging failed' }
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=reset"
+            } else {
+              git push origin HEAD:staging
+              if ($LASTEXITCODE -ne 0) { throw 'git push to staging failed' }
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=fast-forward"
+            }
+          } else {
+            git checkout -B staging origin/dev
+            git push -u origin HEAD:staging
+            if ($LASTEXITCODE -ne 0) { throw 'git push creating staging failed' }
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=created"
+          }
+
+          $sha = (git rev-parse HEAD).Trim()
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "staging_sha=$sha"
+
+      - name: Summary
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          DEPLOYMENT_ID: ${{ steps.promote.outputs.deployment_id }}
+          STATUS: ${{ steps.promote.outputs.status }}
+          ENV_TAG: ${{ steps.resolve.outputs.env_tag }}
+          STAGING_SHA: ${{ steps.git_sync.outputs.staging_sha }}
+          SYNC_MODE: ${{ steps.git_sync.outputs.sync_mode }}
+        run: |
+          @"
+          ### DeployTrack (dev → staging — frontend)
+          - **build_id:** $env:BUILD_ID
+          - **staging deployment_id:** $env:DEPLOYMENT_ID
+          - **status:** $env:STATUS
+          - **Frontend env tag:** ``$env:ENV_TAG``
+          - **Git staging SHA:** ``$env:STAGING_SHA``
+          - **Git sync:** $env:SYNC_MODE
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

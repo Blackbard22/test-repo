@@ -1,0 +1,261 @@
+name: Dev — Frontend lint, build, GHCR, tracker
+
+# allocate DeployTrack frontend build → lint → docker build/push GHCR → report dev deploy
+# Lint failure (after allocate) reports status: failed for env=dev.
+on:
+  push:
+    branches: [dev]
+    paths: ['frontend/**']
+  workflow_dispatch:
+    inputs:
+      fail_lint:
+        description: 'Force lint failure (smoke-test failed deploy reporting)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  lint:
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: powershell
+    outputs:
+      build_id: ${{ steps.allocate.outputs.build_id }}
+      version: ${{ steps.allocate.outputs.version }}
+      build_number: ${{ steps.allocate.outputs.build_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Allocate build in DeployTrack
+        id: allocate
+        env:
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          PROJECT_ID: ${{ secrets.TRACKER_PROJECT_ID }}
+          IMAGE_REPO: ${{ secrets.IMAGE_REPOSITORY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $body = @{
+            project_id       = [int]$env:PROJECT_ID
+            commit_sha       = '${{ github.sha }}'
+            branch           = 'dev'
+            image_repository = $env:IMAGE_REPO
+            component        = 'frontend'
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/builds" -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+
+          $dockerImage = [string]$resp.'docker_image'
+          if (-not $dockerImage -and $resp.build) {
+            $dockerImage = [string]$resp.build.'docker_image'
+          }
+          if (-not $dockerImage) { throw 'DeployTrack allocate response missing docker_image' }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "build_id=$($resp.build.id)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$($resp.version)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "build_number=$($resp.build_number)"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "docker_image<<EOF"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $dockerImage
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
+
+          Write-Host "Allocated frontend build for lint job outputs:"
+          Write-Host "  build_id=$($resp.build.id)"
+          Write-Host "  docker_image=$dockerImage"
+
+      - name: Optional intentional lint failure
+        if: ${{ inputs.fail_lint == true }}
+        run: |
+          Write-Error "Intentional lint failure (fail_lint=true)"
+          exit 1
+
+      - name: Run repo lint scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lintDir = Join-Path $PWD 'ci/lint'
+          $scripts = @()
+          if (Test-Path $lintDir) {
+            $scripts = @(Get-ChildItem -Path $lintDir -File -Filter '*.ps1' |
+              Where-Object { $_.Name -notlike '*.disabled' } |
+              Sort-Object Name)
+          }
+          if ($scripts.Count -gt 0) {
+            foreach ($script in $scripts) {
+              Write-Host ('=== Running ' + $script.Name + ' ===')
+              & $script.FullName
+              if ($LASTEXITCODE -ne 0) { throw ('Lint failed: ' + $script.Name) }
+            }
+          } else {
+            Write-Host 'ci/lint empty or missing - using default frontend checks'
+            if (Test-Path frontend) {
+              Push-Location frontend
+              try {
+                if (Test-Path package-lock.json) { npm ci } else { npm install }
+                $pkg = Get-Content package.json -Raw
+                if ($pkg -match '"lint"\s*:') {
+                  npm run lint
+                  if ($LASTEXITCODE -ne 0) { throw 'npm run lint failed' }
+                } else {
+                  Write-Host 'No npm lint script; skipping'
+                }
+              } finally {
+                Pop-Location
+              }
+            } else {
+              throw 'frontend/ missing - cannot run default frontend lint'
+            }
+          }
+
+      - name: Report failed dev deployment (lint)
+        if: failure() && steps.allocate.outcome == 'success'
+        env:
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ steps.allocate.outputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+          $failBody = @{
+            build_id    = [int]$env:BUILD_ID
+            environment = 'dev'
+            status      = 'failed'
+            deployed_by = 'github-actions'
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
+          } catch {
+            Write-Warning "Failed to report failed lint deploy: $_"
+          }
+
+  build-push:
+    needs: lint
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $user = [string]$env:GHCR_USERNAME
+          $token = [string]$env:GHCR_TOKEN
+          if ([string]::IsNullOrWhiteSpace($user)) { throw 'GHCR_USERNAME secret is empty' }
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'GHCR_TOKEN secret is empty' }
+          $user = $user.Trim()
+          $token = $token.Trim()
+          $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
+          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_CONFIG=$cfg"
+          $env:DOCKER_CONFIG = $cfg
+          $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
+          [System.IO.File]::WriteAllText($patFile, $token)
+          try {
+            cmd /c "docker login ghcr.io -u `"$user`" --password-stdin < `"$patFile`""
+            if ($LASTEXITCODE -ne 0) { throw 'docker login ghcr.io failed' }
+          } finally {
+            Remove-Item -Force $patFile -ErrorAction SilentlyContinue
+          }
+
+      - name: Build and push frontend image
+        id: push
+        env:
+          BUILD_ID: ${{ needs.lint.outputs.build_id }}
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:BUILD_ID) { throw 'BUILD_ID is empty - lint job outputs did not propagate' }
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          Write-Host "Resolving frontend image tag from DeployTrack for build_id=$($env:BUILD_ID)"
+          $build = Invoke-RestMethod -Method GET -Uri "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)" -Headers $headers
+          $dockerImage = [string]$build.'docker_image'
+          if (-not $dockerImage) { throw "build $($env:BUILD_ID) has no docker_image in DeployTrack" }
+
+          Write-Host "  docker_image=$dockerImage"
+          if (-not (Test-Path './frontend')) { throw './frontend directory not found - check checkout working directory' }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_IMAGE=$dockerImage"
+
+          try {
+            docker build -t "$dockerImage" ./frontend
+            if ($LASTEXITCODE -ne 0) { throw 'frontend docker build failed' }
+            docker push "$dockerImage"
+            if ($LASTEXITCODE -ne 0) { throw 'frontend docker push failed' }
+          } catch {
+            $headers = @{ 'Content-Type' = 'application/json' }
+            if ($env:TRACKER_TOKEN) { $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)" }
+            $failBody = @{
+              build_id    = [int]$env:BUILD_ID
+              environment = 'dev'
+              status      = 'failed'
+              deployed_by = 'github-actions'
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $failBody | Out-Null
+            } catch {
+              Write-Warning "Failed to report failed deploy: $_"
+            }
+            throw
+          }
+
+      - name: Record successful dev deployment
+        env:
+          TRACKER_URL: ${{ secrets.TRACKER_URL }}
+          TRACKER_TOKEN: ${{ secrets.CICD_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ needs.lint.outputs.build_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $body = @{
+            build_id    = [int]$env:BUILD_ID
+            environment = 'dev'
+            status      = 'success'
+            deployed_by = 'github-actions'
+          } | ConvertTo-Json -Compress
+
+          $headers = @{ 'Content-Type' = 'application/json' }
+          if ($env:TRACKER_TOKEN) {
+            $headers['Authorization'] = "Bearer $($env:TRACKER_TOKEN)"
+          }
+
+          $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body
+          $resp | ConvertTo-Json -Depth 6
+          Add-Content -Path $env:GITHUB_ENV -Value "DEPLOYMENT_ID=$($resp.id)"
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.lint.outputs.version }}
+          BUILD_NUMBER: ${{ needs.lint.outputs.build_number }}
+          BUILD_ID: ${{ needs.lint.outputs.build_id }}
+        run: |
+          @"
+          ### DeployTrack (dev CI — frontend)
+          - **Version:** $env:VERSION-build$env:BUILD_NUMBER
+          - **Frontend image:** ``$env:DOCKER_IMAGE``
+          - **build_id:** $env:BUILD_ID
+          - **deployment_id:** $env:DEPLOYMENT_ID
+          "@ | Add-Content -Path $env:GITHUB_STEP_SUMMARY

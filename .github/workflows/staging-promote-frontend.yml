@@ -43,9 +43,9 @@ jobs:
           $parts = $dockerImage -split ':', 2
           $envTag = "$($parts[0]):staging"
 
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "docker_image=$dockerImage"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "env_tag=$envTag"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$($build.version)"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image=$dockerImage`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "env_tag=$envTag`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($build.version)`n")
 
       - name: Login to GHCR
         env:
@@ -62,7 +62,7 @@ jobs:
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
           New-Item -ItemType Directory -Force -Path $cfg | Out-Null
           Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
-          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_CONFIG=$cfg"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg`n")
           $env:DOCKER_CONFIG = $cfg
           $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
           [System.IO.File]::WriteAllText($patFile, $token)
@@ -130,8 +130,8 @@ jobs:
           $uri = "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)/promote"
           $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body
           $resp | ConvertTo-Json -Depth 6
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "deployment_id=$($resp.id)"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "status=$($resp.status)"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "deployment_id=$($resp.id)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "status=$($resp.status)`n")
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -158,21 +158,21 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'git reset --hard origin/dev failed' }
               git push --force-with-lease origin HEAD:staging
               if ($LASTEXITCODE -ne 0) { throw 'git push --force-with-lease to staging failed' }
-              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=reset"
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=reset`n")
             } else {
               git push origin HEAD:staging
               if ($LASTEXITCODE -ne 0) { throw 'git push to staging failed' }
-              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=fast-forward"
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=fast-forward`n")
             }
           } else {
             git checkout -B staging origin/dev
             git push -u origin HEAD:staging
             if ($LASTEXITCODE -ne 0) { throw 'git push creating staging failed' }
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=created"
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=created`n")
           }
 
           $sha = (git rev-parse HEAD).Trim()
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "staging_sha=$sha"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "staging_sha=$sha`n")
 
       - name: Summary
         env:

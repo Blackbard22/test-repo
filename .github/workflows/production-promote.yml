@@ -44,11 +44,11 @@ jobs:
           $backendEnv = "${repo}:production"
           $frontendEnv = "${repo}-frontend:production"
 
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "docker_image=$backendImage"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "frontend_image=$frontendImage"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "backend_env=$backendEnv"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "frontend_env=$frontendEnv"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$($build.version)"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image=$backendImage`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "frontend_image=$frontendImage`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "backend_env=$backendEnv`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "frontend_env=$frontendEnv`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($build.version)`n")
 
       # GHCR credentials from the self-hosted runner machine env (never commit PATs).
       # Set User/Machine env: GHCR_USERNAME, GHCR_TOKEN — then restart the runner.
@@ -64,7 +64,7 @@ jobs:
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
           New-Item -ItemType Directory -Force -Path $cfg | Out-Null
           Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
-          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_CONFIG=$cfg"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg`n")
           $env:DOCKER_CONFIG = $cfg
           $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
           [System.IO.File]::WriteAllText($patFile, $token)
@@ -139,8 +139,8 @@ jobs:
           $uri = "$($env:TRACKER_URL)/api/builds/$($env:BUILD_ID)/promote"
           $resp = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $body
           $resp | ConvertTo-Json -Depth 6
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "deployment_id=$($resp.id)"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "status=$($resp.status)"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "deployment_id=$($resp.id)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "status=$($resp.status)`n")
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -167,21 +167,21 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'git reset --hard origin/staging failed' }
               git push --force-with-lease origin HEAD:production
               if ($LASTEXITCODE -ne 0) { throw 'git push --force-with-lease to production failed' }
-              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=reset"
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=reset`n")
             } else {
               git push origin HEAD:production
               if ($LASTEXITCODE -ne 0) { throw 'git push to production failed' }
-              Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=fast-forward"
+              [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=fast-forward`n")
             }
           } else {
             git checkout -B production origin/staging
             git push -u origin HEAD:production
             if ($LASTEXITCODE -ne 0) { throw 'git push creating production failed' }
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "sync_mode=created"
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sync_mode=created`n")
           }
 
           $sha = (git rev-parse HEAD).Trim()
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "production_sha=$sha"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "production_sha=$sha`n")
 
       - name: Summary
         env:

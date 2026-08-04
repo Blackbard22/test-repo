@@ -59,12 +59,12 @@ jobs:
           }
           if (-not $dockerImage) { throw 'DeployTrack allocate response missing docker_image' }
 
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "build_id=$($resp.build.id)"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$($resp.version)"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "build_number=$($resp.build_number)"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "docker_image<<EOF"
-          Add-Content -Path $env:GITHUB_OUTPUT -Value $dockerImage
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "build_id=$($resp.build.id)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$($resp.version)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "build_number=$($resp.build_number)`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "docker_image<<EOF`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "$dockerImage`n")
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "EOF`n")
 
           Write-Host "Allocated frontend build for lint job outputs:"
           Write-Host "  build_id=$($resp.build.id)"
@@ -165,7 +165,7 @@ jobs:
           $cfg = Join-Path $env:RUNNER_TEMP 'docker-config'
           New-Item -ItemType Directory -Force -Path $cfg | Out-Null
           Set-Content -Path (Join-Path $cfg 'config.json') -Value '{}'
-          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_CONFIG=$cfg"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_CONFIG=$cfg`n")
           $env:DOCKER_CONFIG = $cfg
           $patFile = Join-Path $env:RUNNER_TEMP 'ghcr.pat'
           [System.IO.File]::WriteAllText($patFile, $token)
@@ -199,7 +199,7 @@ jobs:
           Write-Host "  docker_image=$dockerImage"
           if (-not (Test-Path './frontend')) { throw './frontend directory not found - check checkout working directory' }
 
-          Add-Content -Path $env:GITHUB_ENV -Value "DOCKER_IMAGE=$dockerImage"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DOCKER_IMAGE=$dockerImage`n")
 
           try {
             docker build -t "$dockerImage" ./frontend
@@ -244,7 +244,7 @@ jobs:
 
           $resp = Invoke-RestMethod -Method POST -Uri "$($env:TRACKER_URL)/api/deployments" -Headers $headers -Body $body
           $resp | ConvertTo-Json -Depth 6
-          Add-Content -Path $env:GITHUB_ENV -Value "DEPLOYMENT_ID=$($resp.id)"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "DEPLOYMENT_ID=$($resp.id)`n")
 
       - name: Summary
         env:
